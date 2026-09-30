@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -22,7 +23,7 @@ const NOTIFICATION_IFACE = "org.freedesktop.Notifications"
 type NotificationResult int
 
 var token string
-var user_id string
+var user_id uint32
 var client = &http.Client{}
 
 func getToken() error {
@@ -32,6 +33,37 @@ func getToken() error {
 	}
 
 	token = strings.TrimSpace(string(token_bytes))
+
+	return nil
+}
+
+func getUserId() error {
+	req, err := http.NewRequest("GET", "https://api.github.com/user", nil)
+	if err != nil {
+		return fmt.Errorf("error building request: %w", err)
+	}
+
+	req.Header.Add("Authorization", "Bearer "+token)
+	req.Header.Add("Accept", "application/vnd.github+json")
+
+	res, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("request failed: %s", res.Status)
+	}
+
+	decoder := json.NewDecoder(res.Body)
+	var user struct {
+		Id uint32 `json:"id"`
+	}
+	if err := decoder.Decode(&user); err != nil {
+		return err
+	}
+
+	user_id = user.Id
 	return nil
 }
 
@@ -126,6 +158,10 @@ func fetchIssueID(url string) (int, error) {
 		return 0, err
 	}
 
+	if res.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("request failed: %s", res.Status)
+	}
+
 	decoder := json.NewDecoder(res.Body)
 	var issue struct {
 		Id int `json:"id"`
@@ -167,12 +203,19 @@ func fetchURL(url string, repo int) (string, error) {
 	}
 
 	payload := []byte(fmt.Sprintf("Repository;%d;Issue;%d", repo, issue))
+	// No clue what these bytes are
+	data := []byte{147, 1, 206}
+	data = binary.BigEndian.AppendUint32(data, user_id)
+	// Or these
+	// I know they are repo / notification independent
+	// Maybe tied to user? like id is above?
+	data = append(data, []byte{218, 0}...)
+	data = append(data, byte(len(payload)))
+	data = append(data, payload...)
 
 	notification_referrer_id := strings.Trim("NT_"+base64.URLEncoding.EncodeToString(
-		append(
-			[]byte{147, 1, 206, 4, 110, 16, 168, 218, 0, byte(len(payload))},
-			payload...,
-		)), "=")
+		data,
+	), "=")
 
 	return fmt.Sprintf("%s?notification_referrer_id=%s", pull.HtmlURL, notification_referrer_id), nil
 }
@@ -319,6 +362,9 @@ func main() {
 
 	if err := getToken(); err != nil {
 		panic(fmt.Errorf("token error: %w", err))
+	}
+	if err := getUserId(); err != nil {
+		panic(fmt.Errorf("user id error: %w", err))
 	}
 
 	req, err := http.NewRequest("GET", "https://api.github.com/notifications", nil)
