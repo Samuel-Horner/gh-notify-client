@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -20,6 +22,7 @@ const NOTIFICATION_IFACE = "org.freedesktop.Notifications"
 type NotificationResult int
 
 var token string
+var user_id string
 var client = &http.Client{}
 
 func getToken() error {
@@ -40,10 +43,14 @@ type Notification struct {
 		Title string `json:"title"`
 		URL   string `json:"url"`
 	} `json:"subject"`
+	Repository struct {
+		Id int `json:"id"`
+	} `json:"repository"`
 }
 
 type Pull struct {
-	HtmlURL string `json:"html_url"`
+	HtmlURL  string `json:"html_url"`
+	IssueURL string `json:"issue_url"`
 }
 
 func fetch(req *http.Request) ([]Notification, int, error) {
@@ -105,10 +112,35 @@ func fetch(req *http.Request) ([]Notification, int, error) {
 	return []Notification{}, max(MIN_POLLING_DELAY, poll_interval), nil
 }
 
-func fetchURL(url string) (string, error) {
+func fetchIssueID(url string) (int, error) {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		panic(fmt.Errorf("error building request: %w", err))
+		return 0, fmt.Errorf("error building request: %w", err)
+	}
+
+	req.Header.Add("Authorization", "Bearer "+token)
+	req.Header.Add("Accept", "application/vnd.github+json")
+
+	res, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+
+	decoder := json.NewDecoder(res.Body)
+	var issue struct {
+		Id int `json:"id"`
+	}
+	if err := decoder.Decode(&issue); err != nil {
+		return 0, err
+	}
+
+	return issue.Id, nil
+}
+
+func fetchURL(url string, repo int) (string, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("error building request: %w", err)
 	}
 
 	req.Header.Add("Authorization", "Bearer "+token)
@@ -129,7 +161,20 @@ func fetchURL(url string) (string, error) {
 		return "", err
 	}
 
-	return pull.HtmlURL, nil
+	issue, err := fetchIssueID(pull.IssueURL)
+	if err != nil {
+		return "", err
+	}
+
+	payload := []byte(fmt.Sprintf("Repository;%d;Issue;%d", repo, issue))
+
+	notification_referrer_id := strings.Trim("NT_"+base64.URLEncoding.EncodeToString(
+		append(
+			[]byte{147, 1, 206, 4, 110, 16, 168, 218, 0, byte(len(payload))},
+			payload...,
+		)), "=")
+
+	return fmt.Sprintf("%s?notification_referrer_id=%s", pull.HtmlURL, notification_referrer_id), nil
 }
 
 func markAsRead(id string) error {
@@ -154,13 +199,14 @@ func markAsRead(id string) error {
 }
 
 type NotificationInstance struct {
-	url string
-	id  string
+	url  string
+	repo int
+	id   string
 }
 
 var notification_instances = make(map[uint32]NotificationInstance)
 
-func notify(conn *dbus.Conn, title string, body string, url string, thread_id string, timeout time.Duration) error {
+func notify(conn *dbus.Conn, title string, body string, url string, thread_id string, repo int, timeout time.Duration) error {
 	actions := []string{
 		"default",
 		"Open",
@@ -187,7 +233,7 @@ func notify(conn *dbus.Conn, title string, body string, url string, thread_id st
 		return err
 	}
 
-	notification_instances[id] = NotificationInstance{url, thread_id}
+	notification_instances[id] = NotificationInstance{url, repo, thread_id}
 
 	return nil
 }
@@ -239,7 +285,7 @@ func main() {
 					if action == "default" {
 						// Spawn go-routines to open URL and mark as read
 						go func() {
-							url, err := fetchURL(instance.url)
+							url, err := fetchURL(instance.url, instance.repo)
 							if err != nil {
 								fmt.Printf(`error fetching html url "%s": %s\n`, url, err.Error())
 							}
@@ -286,12 +332,12 @@ func main() {
 	for {
 		notifications, delay, err := fetch(req)
 		if err != nil {
-			panic(fmt.Errorf("error requesting notifications: %w", err))
+			fmt.Fprint(os.Stderr, "%s\n", err.Error())
 		}
 
 		for _, notification := range notifications {
-			if err = notify(conn, notification.Subject.Title, notification.Reason, notification.Subject.URL, notification.Id, time.Duration(15)*time.Second); err != nil {
-				panic(err)
+			if err = notify(conn, notification.Subject.Title, notification.Reason, notification.Subject.URL, notification.Id, notification.Repository.Id, time.Duration(15)*time.Second); err != nil {
+				fmt.Fprint(os.Stderr, "%s\n", err.Error())
 			}
 		}
 
