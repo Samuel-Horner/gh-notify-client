@@ -338,7 +338,7 @@ func main() {
 							}
 						}()
 
-						go markAsRead(instance.id)
+						// go markAsRead(instance.id)
 
 						delete(notification_instances, id)
 					}
